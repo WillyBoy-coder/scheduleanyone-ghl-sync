@@ -87,6 +87,34 @@ async function withRetry(fn, label, maxAttempts = 4) {
   }
 }
 
+function groupServiceRows(records) {
+  const grouped = new Map();
+
+  for (const record of records) {
+    const ticket = record.TicketNumber;
+    if (!ticket) continue;
+
+    // Prefer rows that are real service rows
+    if (record.Item !== "Service") continue;
+
+    if (!grouped.has(ticket)) {
+      grouped.set(ticket, record);
+    } else {
+      const existing = grouped.get(ticket);
+
+      // Keep the earliest created/purchase row if multiple service rows exist
+      const existingStart = toNYISO(existing.StartDate);
+      const currentStart = toNYISO(record.StartDate);
+
+      if (currentStart && existingStart && currentStart < existingStart) {
+        grouped.set(ticket, record);
+      }
+    }
+  }
+
+  return Array.from(grouped.values());
+}
+
 async function getScheduleAnyoneData(startDate, endDate) {
   const response = await axios.get(
     "https://www.membershipsalons.com/report/saledetailapi",
@@ -126,6 +154,41 @@ async function findExistingContactByPhone(phone) {
   }
 }
 
+async function searchContactByTicketNumber(ticketNumber) {
+  if (!ticketNumber) return null;
+
+  try {
+    const response = await axios.post(
+      `${process.env.GHL_BASE_URL}/contacts/search`,
+      {
+        locationId: process.env.GHL_LOCATION_ID,
+        page: 1,
+        pageLimit: 10,
+        filters: [
+          {
+            field: "customFields.ticket_number",
+            operator: "eq",
+            value: ticketNumber
+          }
+        ]
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.GHL_TOKEN}`,
+          Version: "2021-07-28",
+          "Content-Type": "application/json"
+        }
+      }
+    );
+
+    const contacts = response.data?.contacts || response.data?.data || [];
+    return contacts[0] || null;
+  } catch (error) {
+    console.log("Ticket search failed:", error.response?.data || error.message);
+    return null;
+  }
+}
+
 async function createContact(record) {
   const { firstName, lastName } = splitName(record.Customer || "");
   const phone = normalizePhone(record.MobilePhone || "");
@@ -135,7 +198,13 @@ async function createContact(record) {
     firstName,
     lastName,
     phone,
-    source: "Schedule Anyone"
+    source: "Schedule Anyone",
+    customFields: [
+      {
+        key: "ticket_number",
+        field_value: record.TicketNumber || ""
+      }
+    ]
   };
 
   const response = await axios.post(
@@ -153,18 +222,52 @@ async function createContact(record) {
   return response.data?.contact || response.data;
 }
 
+async function updateContactTicketNumber(contactId, ticketNumber) {
+  if (!contactId || !ticketNumber) return null;
+
+  const response = await axios.put(
+    `${process.env.GHL_BASE_URL}/contacts/${contactId}`,
+    {
+      customFields: [
+        {
+          key: "ticket_number",
+          field_value: ticketNumber
+        }
+      ]
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.GHL_TOKEN}`,
+        Version: "2021-07-28",
+        "Content-Type": "application/json"
+      }
+    }
+  );
+
+  return response.data?.contact || response.data;
+}
+
 async function getOrCreateContact(record) {
+  const ticketMatch = await searchContactByTicketNumber(record.TicketNumber);
+  if (ticketMatch?.id) return ticketMatch;
+
   const phone = normalizePhone(record.MobilePhone || "");
   if (!phone) return null;
 
   const existing = await findExistingContactByPhone(phone);
-  if (existing?.id) return existing;
+  if (existing?.id) {
+    await updateContactTicketNumber(existing.id, record.TicketNumber);
+    return existing;
+  }
 
   try {
     return await createContact(record);
   } catch (error) {
     const duplicateId = error.response?.data?.meta?.contactId;
-    if (duplicateId) return { id: duplicateId };
+    if (duplicateId) {
+      await updateContactTicketNumber(duplicateId, record.TicketNumber);
+      return { id: duplicateId };
+    }
     throw error;
   }
 }
@@ -211,10 +314,13 @@ module.exports = async function handler(req, res) {
     }
 
     const { start, end } = getWindow();
-    const records = await withRetry(
+
+    const rawRecords = await withRetry(
       () => getScheduleAnyoneData(start, end),
       "Schedule Anyone fetch"
     );
+
+    const records = groupServiceRows(rawRecords);
 
     let created = 0;
     let skipped = 0;
@@ -269,6 +375,17 @@ module.exports = async function handler(req, res) {
           continue;
         }
 
+        const existingByTicket = await searchContactByTicketNumber(record.TicketNumber);
+        if (existingByTicket?.id) {
+          skipped++;
+          skippedDetails.push({
+            ticket,
+            customer,
+            reason: "ticket already exists in GHL contact"
+          });
+          continue;
+        }
+
         const contact = await withRetry(
           () => getOrCreateContact(record),
           `Contact sync for ${ticket}`
@@ -304,7 +421,8 @@ module.exports = async function handler(req, res) {
     return res.status(200).json({
       ok: true,
       window: { start, end },
-      totalRecords: records.length,
+      rawRecordCount: rawRecords.length,
+      groupedServiceCount: records.length,
       created,
       skipped,
       errors,
