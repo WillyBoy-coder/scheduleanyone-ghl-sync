@@ -176,7 +176,7 @@ async function createAppointment(record, contactId, startTime, endTime) {
     contactId,
     startTime,
     endTime,
-    title: record.ItemDescription || "Schedule Anyone Appointment",
+    title: `${record.Customer || "Unknown"} - ${record.ItemDescription || "Schedule Anyone Appointment"}`,
     appointmentStatus: "confirmed",
     ignoreFreeSlotValidation: true,
     ignoreDateRange: true
@@ -211,25 +211,25 @@ module.exports = async function handler(req, res) {
     }
 
     const { start, end } = getWindow();
-    console.log(`Checking Schedule Anyone from ${start} to ${end}`);
-
     const records = await withRetry(
       () => getScheduleAnyoneData(start, end),
       "Schedule Anyone fetch"
     );
 
-    console.log(`Found ${records.length} records`);
-
     let created = 0;
     let skipped = 0;
     let errors = 0;
+    const skippedDetails = [];
 
     for (const record of records) {
       const ticket = record.TicketNumber || "(no-ticket)";
+      const customer = record.Customer || "(no-customer)";
+      const phone = normalizePhone(record.MobilePhone || "");
 
       try {
         if (!record.TicketNumber) {
           skipped++;
+          skippedDetails.push({ ticket, customer, reason: "missing TicketNumber" });
           continue;
         }
 
@@ -237,13 +237,35 @@ module.exports = async function handler(req, res) {
         const endTime = toNYISO(record.EndDate);
 
         if (!startTime || !endTime) {
-          console.log(`Skipping ${ticket}: invalid date`);
           skipped++;
+          skippedDetails.push({
+            ticket,
+            customer,
+            reason: "invalid date",
+            startDate: record.StartDate,
+            endDate: record.EndDate
+          });
           continue;
         }
 
         if (isPastAppointment(startTime)) {
           skipped++;
+          skippedDetails.push({
+            ticket,
+            customer,
+            reason: "past appointment",
+            startTime
+          });
+          continue;
+        }
+
+        if (!phone) {
+          skipped++;
+          skippedDetails.push({
+            ticket,
+            customer,
+            reason: "missing phone"
+          });
           continue;
         }
 
@@ -253,8 +275,12 @@ module.exports = async function handler(req, res) {
         );
 
         if (!contact?.id) {
-          console.log(`Skipping ${ticket}: no contact id`);
           skipped++;
+          skippedDetails.push({
+            ticket,
+            customer,
+            reason: "no contact id returned"
+          });
           continue;
         }
 
@@ -264,12 +290,14 @@ module.exports = async function handler(req, res) {
         );
 
         created++;
-        console.log(`Created: ${ticket}`);
-
-        await sleep(250);
       } catch (error) {
         errors++;
-        console.log(`Error on ${ticket}:`, error.response?.data || error.message);
+        skippedDetails.push({
+          ticket,
+          customer,
+          reason: "exception",
+          error: error.response?.data || error.message
+        });
       }
     }
 
@@ -279,11 +307,10 @@ module.exports = async function handler(req, res) {
       totalRecords: records.length,
       created,
       skipped,
-      errors
+      errors,
+      skippedDetails
     });
   } catch (error) {
-    console.log("Cron failed:", error.response?.data || error.message);
-
     return res.status(500).json({
       ok: false,
       message: error.response?.data || error.message
