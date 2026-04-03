@@ -146,8 +146,13 @@ function groupByTicket(records) {
 function getCustomFieldValue(contact, fieldKey) {
   if (!contact || !fieldKey) return null;
 
-  if (contact.customFields && Array.isArray(contact.customFields)) {
-    const match = contact.customFields.find(
+  const arraysToCheck = [];
+
+  if (Array.isArray(contact.customFields)) arraysToCheck.push(contact.customFields);
+  if (Array.isArray(contact.customField)) arraysToCheck.push(contact.customField);
+
+  for (const fields of arraysToCheck) {
+    const match = fields.find(
       (field) =>
         field.id === fieldKey ||
         field.key === fieldKey ||
@@ -155,20 +160,7 @@ function getCustomFieldValue(contact, fieldKey) {
     );
 
     if (match) {
-      return match.value ?? null;
-    }
-  }
-
-  if (contact.customField && Array.isArray(contact.customField)) {
-    const match = contact.customField.find(
-      (field) =>
-        field.id === fieldKey ||
-        field.key === fieldKey ||
-        field.fieldKey === fieldKey
-    );
-
-    if (match) {
-      return match.value ?? null;
+      return match.value ?? match.field_value ?? null;
     }
   }
 
@@ -203,6 +195,22 @@ async function findExistingContactByPhone(phone) {
   }
 }
 
+async function getContactById(contactId) {
+  if (!contactId) return null;
+
+  const response = await axios.get(
+    `${process.env.GHL_BASE_URL}/contacts/${contactId}`,
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.GHL_TOKEN}`,
+        Version: "2021-07-28"
+      }
+    }
+  );
+
+  return response.data?.contact || response.data || null;
+}
+
 async function createContact(appointment) {
   const { firstName, lastName } = splitName(appointment.customer || "");
   const phone = normalizePhone(appointment.phone || "");
@@ -232,9 +240,7 @@ async function createContact(appointment) {
 }
 
 async function updateContactTicketField(contactId, ticket) {
-  if (!contactId || !ticket || !TICKET_FIELD_KEY || TICKET_FIELD_KEY === "last_schedule_anyone_ticket") {
-    return;
-  }
+  if (!contactId || !ticket || !TICKET_FIELD_KEY) return;
 
   const body = {
     customFields: [
@@ -373,9 +379,20 @@ module.exports = async function handler(req, res) {
           continue;
         }
 
-        const existingTicket = getCustomFieldValue(contact, TICKET_FIELD_KEY);
+        // IMPORTANT: fetch full contact so custom fields are available
+        const fullContact = await withRetry(
+          () => getContactById(contact.id),
+          `Fetch full contact for ${ticket}`
+        );
 
-        if (existingTicket && String(existingTicket).trim() === String(ticket).trim()) {
+        const existingTicket = getCustomFieldValue(fullContact, TICKET_FIELD_KEY);
+
+        console.log(`Ticket check for ${ticket}: existing=${existingTicket || "EMPTY"} current=${ticket}`);
+
+        if (
+          existingTicket &&
+          String(existingTicket).trim() === String(ticket).trim()
+        ) {
           skipped++;
           skippedDetails.push({
             ticket,
