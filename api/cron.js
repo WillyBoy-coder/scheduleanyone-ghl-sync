@@ -232,7 +232,7 @@ async function createContact(appointment) {
 }
 
 async function updateContactTicketField(contactId, ticket) {
-  if (!contactId || !ticket || !TICKET_FIELD_KEY || TICKET_FIELD_KEY === "CUSTOM_FIELD_KEY_HERE") {
+  if (!contactId || !ticket || !TICKET_FIELD_KEY || TICKET_FIELD_KEY === "contact.last_schedule_anyone_ticket") {
     return;
   }
 
