@@ -1,6 +1,8 @@
 const axios = require("axios");
 const { DateTime } = require("luxon");
 
+const TICKET_FIELD_KEY = "last_schedule_anyone_ticket";
+
 function splitName(fullName = "") {
   const parts = String(fullName).trim().split(/\s+/);
   const firstName = parts.shift() || "Unknown";
@@ -87,34 +89,6 @@ async function withRetry(fn, label, maxAttempts = 4) {
   }
 }
 
-function groupServiceRows(records) {
-  const grouped = new Map();
-
-  for (const record of records) {
-    const ticket = record.TicketNumber;
-    if (!ticket) continue;
-
-    // Prefer rows that are real service rows
-    if (record.Item !== "Service") continue;
-
-    if (!grouped.has(ticket)) {
-      grouped.set(ticket, record);
-    } else {
-      const existing = grouped.get(ticket);
-
-      // Keep the earliest created/purchase row if multiple service rows exist
-      const existingStart = toNYISO(existing.StartDate);
-      const currentStart = toNYISO(record.StartDate);
-
-      if (currentStart && existingStart && currentStart < existingStart) {
-        grouped.set(ticket, record);
-      }
-    }
-  }
-
-  return Array.from(grouped.values());
-}
-
 async function getScheduleAnyoneData(startDate, endDate) {
   const response = await axios.get(
     "https://www.membershipsalons.com/report/saledetailapi",
@@ -128,6 +102,81 @@ async function getScheduleAnyoneData(startDate, endDate) {
   );
 
   return Array.isArray(response.data) ? response.data : [];
+}
+
+function groupByTicket(records) {
+  const grouped = new Map();
+
+  for (const record of records) {
+    const ticket = record.TicketNumber;
+    if (!ticket) continue;
+
+    if (!grouped.has(ticket)) {
+      grouped.set(ticket, []);
+    }
+
+    grouped.get(ticket).push(record);
+  }
+
+  const groupedAppointments = [];
+
+  for (const [ticket, items] of grouped.entries()) {
+    const first = items[0];
+
+    const descriptions = items
+      .map((item) => item.ItemDescription)
+      .filter(Boolean);
+
+    groupedAppointments.push({
+      ticket,
+      customer: first.Customer || "",
+      phone: first.MobilePhone || "",
+      email: first.Email || "",
+      staffName: first.StaffName || "",
+      startDate: first.StartDate,
+      endDate: first.EndDate,
+      title: descriptions.join(" + ") || first.ItemDescription || "Schedule Anyone Appointment",
+      rawItems: items
+    });
+  }
+
+  return groupedAppointments;
+}
+
+function getCustomFieldValue(contact, fieldKey) {
+  if (!contact || !fieldKey) return null;
+
+  if (contact.customFields && Array.isArray(contact.customFields)) {
+    const match = contact.customFields.find(
+      (field) =>
+        field.id === fieldKey ||
+        field.key === fieldKey ||
+        field.fieldKey === fieldKey
+    );
+
+    if (match) {
+      return match.value ?? null;
+    }
+  }
+
+  if (contact.customField && Array.isArray(contact.customField)) {
+    const match = contact.customField.find(
+      (field) =>
+        field.id === fieldKey ||
+        field.key === fieldKey ||
+        field.fieldKey === fieldKey
+    );
+
+    if (match) {
+      return match.value ?? null;
+    }
+  }
+
+  if (contact[fieldKey] !== undefined) {
+    return contact[fieldKey];
+  }
+
+  return null;
 }
 
 async function findExistingContactByPhone(phone) {
@@ -154,57 +203,17 @@ async function findExistingContactByPhone(phone) {
   }
 }
 
-async function searchContactByTicketNumber(ticketNumber) {
-  if (!ticketNumber) return null;
-
-  try {
-    const response = await axios.post(
-      `${process.env.GHL_BASE_URL}/contacts/search`,
-      {
-        locationId: process.env.GHL_LOCATION_ID,
-        page: 1,
-        pageLimit: 10,
-        filters: [
-          {
-            field: "customFields.ticket_number",
-            operator: "eq",
-            value: ticketNumber
-          }
-        ]
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.GHL_TOKEN}`,
-          Version: "2021-07-28",
-          "Content-Type": "application/json"
-        }
-      }
-    );
-
-    const contacts = response.data?.contacts || response.data?.data || [];
-    return contacts[0] || null;
-  } catch (error) {
-    console.log("Ticket search failed:", error.response?.data || error.message);
-    return null;
-  }
-}
-
-async function createContact(record) {
-  const { firstName, lastName } = splitName(record.Customer || "");
-  const phone = normalizePhone(record.MobilePhone || "");
+async function createContact(appointment) {
+  const { firstName, lastName } = splitName(appointment.customer || "");
+  const phone = normalizePhone(appointment.phone || "");
 
   const body = {
     locationId: process.env.GHL_LOCATION_ID,
     firstName,
     lastName,
     phone,
-    source: "Schedule Anyone",
-    customFields: [
-      {
-        key: "ticket_number",
-        field_value: record.TicketNumber || ""
-      }
-    ]
+    email: appointment.email || undefined,
+    source: "Schedule Anyone"
   };
 
   const response = await axios.post(
@@ -222,19 +231,23 @@ async function createContact(record) {
   return response.data?.contact || response.data;
 }
 
-async function updateContactTicketNumber(contactId, ticketNumber) {
-  if (!contactId || !ticketNumber) return null;
+async function updateContactTicketField(contactId, ticket) {
+  if (!contactId || !ticket || !TICKET_FIELD_KEY || TICKET_FIELD_KEY === "CUSTOM_FIELD_KEY_HERE") {
+    return;
+  }
 
-  const response = await axios.put(
+  const body = {
+    customFields: [
+      {
+        key: TICKET_FIELD_KEY,
+        field_value: ticket
+      }
+    ]
+  };
+
+  await axios.put(
     `${process.env.GHL_BASE_URL}/contacts/${contactId}`,
-    {
-      customFields: [
-        {
-          key: "ticket_number",
-          field_value: ticketNumber
-        }
-      ]
-    },
+    body,
     {
       headers: {
         Authorization: `Bearer ${process.env.GHL_TOKEN}`,
@@ -243,43 +256,32 @@ async function updateContactTicketNumber(contactId, ticketNumber) {
       }
     }
   );
-
-  return response.data?.contact || response.data;
 }
 
-async function getOrCreateContact(record) {
-  const ticketMatch = await searchContactByTicketNumber(record.TicketNumber);
-  if (ticketMatch?.id) return ticketMatch;
-
-  const phone = normalizePhone(record.MobilePhone || "");
+async function getOrCreateContact(appointment) {
+  const phone = normalizePhone(appointment.phone || "");
   if (!phone) return null;
 
   const existing = await findExistingContactByPhone(phone);
-  if (existing?.id) {
-    await updateContactTicketNumber(existing.id, record.TicketNumber);
-    return existing;
-  }
+  if (existing?.id) return existing;
 
   try {
-    return await createContact(record);
+    return await createContact(appointment);
   } catch (error) {
     const duplicateId = error.response?.data?.meta?.contactId;
-    if (duplicateId) {
-      await updateContactTicketNumber(duplicateId, record.TicketNumber);
-      return { id: duplicateId };
-    }
+    if (duplicateId) return { id: duplicateId };
     throw error;
   }
 }
 
-async function createAppointment(record, contactId, startTime, endTime) {
+async function createAppointment(appointment, contactId, startTime, endTime) {
   const body = {
     calendarId: process.env.GHL_CALENDAR_ID,
     locationId: process.env.GHL_LOCATION_ID,
     contactId,
     startTime,
     endTime,
-    title: `${record.Customer || "Unknown"} - ${record.ItemDescription || "Schedule Anyone Appointment"}`,
+    title: appointment.title || "Schedule Anyone Appointment",
     appointmentStatus: "confirmed",
     ignoreFreeSlotValidation: true,
     ignoreDateRange: true
@@ -314,42 +316,33 @@ module.exports = async function handler(req, res) {
     }
 
     const { start, end } = getWindow();
+    console.log(`Checking Schedule Anyone from ${start} to ${end}`);
 
     const rawRecords = await withRetry(
       () => getScheduleAnyoneData(start, end),
       "Schedule Anyone fetch"
     );
 
-    const records = groupServiceRows(rawRecords);
+    const groupedAppointments = groupByTicket(rawRecords);
 
     let created = 0;
     let skipped = 0;
     let errors = 0;
     const skippedDetails = [];
 
-    for (const record of records) {
-      const ticket = record.TicketNumber || "(no-ticket)";
-      const customer = record.Customer || "(no-customer)";
-      const phone = normalizePhone(record.MobilePhone || "");
+    for (const appointment of groupedAppointments) {
+      const ticket = appointment.ticket;
 
       try {
-        if (!record.TicketNumber) {
-          skipped++;
-          skippedDetails.push({ ticket, customer, reason: "missing TicketNumber" });
-          continue;
-        }
-
-        const startTime = toNYISO(record.StartDate);
-        const endTime = toNYISO(record.EndDate);
+        const startTime = toNYISO(appointment.startDate);
+        const endTime = toNYISO(appointment.endDate);
 
         if (!startTime || !endTime) {
           skipped++;
           skippedDetails.push({
             ticket,
-            customer,
-            reason: "invalid date",
-            startDate: record.StartDate,
-            endDate: record.EndDate
+            customer: appointment.customer,
+            reason: "invalid date"
           });
           continue;
         }
@@ -358,36 +351,15 @@ module.exports = async function handler(req, res) {
           skipped++;
           skippedDetails.push({
             ticket,
-            customer,
+            customer: appointment.customer,
             reason: "past appointment",
             startTime
           });
           continue;
         }
 
-        if (!phone) {
-          skipped++;
-          skippedDetails.push({
-            ticket,
-            customer,
-            reason: "missing phone"
-          });
-          continue;
-        }
-
-        const existingByTicket = await searchContactByTicketNumber(record.TicketNumber);
-        if (existingByTicket?.id) {
-          skipped++;
-          skippedDetails.push({
-            ticket,
-            customer,
-            reason: "ticket already exists in GHL contact"
-          });
-          continue;
-        }
-
         const contact = await withRetry(
-          () => getOrCreateContact(record),
+          () => getOrCreateContact(appointment),
           `Contact sync for ${ticket}`
         );
 
@@ -395,26 +367,41 @@ module.exports = async function handler(req, res) {
           skipped++;
           skippedDetails.push({
             ticket,
-            customer,
-            reason: "no contact id returned"
+            customer: appointment.customer,
+            reason: "no contact id"
+          });
+          continue;
+        }
+
+        const existingTicket = getCustomFieldValue(contact, TICKET_FIELD_KEY);
+
+        if (existingTicket && String(existingTicket).trim() === String(ticket).trim()) {
+          skipped++;
+          skippedDetails.push({
+            ticket,
+            customer: appointment.customer,
+            reason: "duplicate ticket on contact"
           });
           continue;
         }
 
         await withRetry(
-          () => createAppointment(record, contact.id, startTime, endTime),
+          () => createAppointment(appointment, contact.id, startTime, endTime),
           `Create appointment for ${ticket}`
         );
 
+        await withRetry(
+          () => updateContactTicketField(contact.id, ticket),
+          `Update ticket field for ${ticket}`
+        );
+
         created++;
+        console.log(`Created: ${ticket}`);
+
+        await sleep(250);
       } catch (error) {
         errors++;
-        skippedDetails.push({
-          ticket,
-          customer,
-          reason: "exception",
-          error: error.response?.data || error.message
-        });
+        console.log(`Error on ${ticket}:`, error.response?.data || error.message);
       }
     }
 
@@ -422,13 +409,15 @@ module.exports = async function handler(req, res) {
       ok: true,
       window: { start, end },
       rawRecordCount: rawRecords.length,
-      groupedServiceCount: records.length,
+      groupedServiceCount: groupedAppointments.length,
       created,
       skipped,
       errors,
       skippedDetails
     });
   } catch (error) {
+    console.log("Cron failed:", error.response?.data || error.message);
+
     return res.status(500).json({
       ok: false,
       message: error.response?.data || error.message
