@@ -1,7 +1,7 @@
 const axios = require("axios");
 const { DateTime } = require("luxon");
 
-const TICKET_FIELD_KEY = "last_schedule_anyone_ticket";
+const TICKET_FIELD_KEY = "abc123xyz";
 
 function splitName(fullName = "") {
   const parts = String(fullName).trim().split(/\s+/);
