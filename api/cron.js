@@ -1,10 +1,6 @@
 const axios = require("axios");
 const { DateTime } = require("luxon");
 
-const TICKET_FIELD_ID = "7QyUxkYPiPamWxnpnj1L";
-const TICKET_FIELD_API_KEY = "contact.last_schedule_anyone_ticket";
-const TICKET_FIELD_NAME = "Last Schedule Anyone Ticket";
-
 function splitName(fullName = "") {
   const parts = String(fullName).trim().split(/\s+/);
   const firstName = parts.shift() || "Unknown";
@@ -15,6 +11,10 @@ function splitName(fullName = "") {
 function normalizePhone(phone) {
   if (!phone) return "";
   return String(phone).replace(/[^\d+]/g, "").trim();
+}
+
+function normalizeTitle(title = "") {
+  return String(title).trim().replace(/\s+/g, " ").toLowerCase();
 }
 
 function toNYISO(dateStr) {
@@ -145,41 +145,6 @@ function groupByTicket(records) {
   return groupedAppointments;
 }
 
-function getCustomFieldValue(contact) {
-  if (!contact) return null;
-
-  if (contact[TICKET_FIELD_ID] !== undefined && contact[TICKET_FIELD_ID] !== null) {
-    const value = String(contact[TICKET_FIELD_ID]).trim();
-    if (value) return value;
-  }
-
-  if (contact[TICKET_FIELD_API_KEY] !== undefined && contact[TICKET_FIELD_API_KEY] !== null) {
-    const value = String(contact[TICKET_FIELD_API_KEY]).trim();
-    if (value) return value;
-  }
-
-  const arraysToCheck = [
-    contact.customFields,
-    contact.customField
-  ].filter(Array.isArray);
-
-  for (const fields of arraysToCheck) {
-    for (const field of fields) {
-      if (
-        field.id === TICKET_FIELD_ID ||
-        field.key === TICKET_FIELD_API_KEY ||
-        field.fieldKey === TICKET_FIELD_API_KEY ||
-        field.name === TICKET_FIELD_NAME
-      ) {
-        const value = String(field.value ?? field.field_value ?? "").trim();
-        if (value) return value;
-      }
-    }
-  }
-
-  return null;
-}
-
 async function findExistingContactByPhone(phone) {
   if (!phone) return null;
 
@@ -202,22 +167,6 @@ async function findExistingContactByPhone(phone) {
   } catch {
     return null;
   }
-}
-
-async function getContactById(contactId) {
-  if (!contactId) return null;
-
-  const response = await axios.get(
-    `${process.env.GHL_BASE_URL}/contacts/${contactId}`,
-    {
-      headers: {
-        Authorization: `Bearer ${process.env.GHL_TOKEN}`,
-        Version: "2021-07-28"
-      }
-    }
-  );
-
-  return response.data?.contact || response.data || null;
 }
 
 async function createContact(appointment) {
@@ -248,31 +197,6 @@ async function createContact(appointment) {
   return response.data?.contact || response.data;
 }
 
-async function updateContactTicketField(contactId, ticket) {
-  if (!contactId || !ticket) return;
-
-  const body = {
-    customFields: [
-      {
-        id: TICKET_FIELD_ID,
-        field_value: String(ticket).trim()
-      }
-    ]
-  };
-
-  await axios.put(
-    `${process.env.GHL_BASE_URL}/contacts/${contactId}`,
-    body,
-    {
-      headers: {
-        Authorization: `Bearer ${process.env.GHL_TOKEN}`,
-        Version: "2021-07-28",
-        "Content-Type": "application/json"
-      }
-    }
-  );
-}
-
 async function getOrCreateContact(appointment) {
   const phone = normalizePhone(appointment.phone || "");
   if (!phone) return null;
@@ -287,6 +211,60 @@ async function getOrCreateContact(appointment) {
     if (duplicateId) return { id: duplicateId };
     throw error;
   }
+}
+
+async function getCalendarEventsForWindow(startTime, endTime) {
+  const startMillis = DateTime.fromISO(startTime).toMillis();
+  const endMillis = DateTime.fromISO(endTime).toMillis();
+
+  const response = await axios.get(
+    `${process.env.GHL_BASE_URL}/calendars/events`,
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.GHL_TOKEN}`,
+        Version: "2021-04-15"
+      },
+      params: {
+        calendarId: process.env.GHL_CALENDAR_ID,
+        startTime: String(startMillis),
+        endTime: String(endMillis)
+      }
+    }
+  );
+
+  return (
+    response.data?.events ||
+    response.data?.data ||
+    response.data?.results ||
+    []
+  );
+}
+
+function eventMatchesAppointment(event, appointment, contactId, startTime, endTime) {
+  const eventContactId =
+    event.contactId ||
+    event.contact?.id ||
+    event.contact?.contactId ||
+    null;
+
+  const eventStart = event.startTime || event.start || event.startAt || null;
+  const eventEnd = event.endTime || event.end || event.endAt || null;
+  const eventTitle = normalizeTitle(event.title || event.name || "");
+
+  return (
+    String(eventContactId || "") === String(contactId) &&
+    String(eventStart || "") === String(startTime) &&
+    String(eventEnd || "") === String(endTime) &&
+    eventTitle === normalizeTitle(appointment.title)
+  );
+}
+
+async function appointmentAlreadyExists(appointment, contactId, startTime, endTime) {
+  const events = await getCalendarEventsForWindow(startTime, endTime);
+
+  return events.some((event) =>
+    eventMatchesAppointment(event, appointment, contactId, startTime, endTime)
+  );
 }
 
 async function createAppointment(appointment, contactId, startTime, endTime) {
@@ -388,23 +366,19 @@ module.exports = async function handler(req, res) {
           continue;
         }
 
-        const fullContact = await withRetry(
-          () => getContactById(contact.id),
-          `Fetch full contact for ${ticket}`
+        const exists = await withRetry(
+          () => appointmentAlreadyExists(appointment, contact.id, startTime, endTime),
+          `Check existing appointment for ${ticket}`
         );
 
-        const existingTicket = getCustomFieldValue(fullContact);
+        console.log(`Appointment existence for ${ticket}: ${exists ? "YES" : "NO"}`);
 
-        console.log(
-          `Ticket check for ${ticket}: existing=${existingTicket || "EMPTY"} current=${ticket}`
-        );
-
-        if (existingTicket && existingTicket === ticket) {
+        if (exists) {
           skipped++;
           skippedDetails.push({
             ticket,
             customer: appointment.customer,
-            reason: "duplicate ticket on contact"
+            reason: "matching appointment already exists"
           });
           continue;
         }
@@ -412,11 +386,6 @@ module.exports = async function handler(req, res) {
         await withRetry(
           () => createAppointment(appointment, contact.id, startTime, endTime),
           `Create appointment for ${ticket}`
-        );
-
-        await withRetry(
-          () => updateContactTicketField(contact.id, ticket),
-          `Update ticket field for ${ticket}`
         );
 
         created++;
