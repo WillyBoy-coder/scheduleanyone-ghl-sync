@@ -1,7 +1,9 @@
 const axios = require("axios");
 const { DateTime } = require("luxon");
 
-const TICKET_FIELD_KEY = "7QyUxkYPiPamWxnpnj1L";
+const TICKET_FIELD_ID = "7QyUxkYPiPamWxnpnj1L";
+const TICKET_FIELD_API_KEY = "contact.last_schedule_anyone_ticket";
+const TICKET_FIELD_NAME = "Last Schedule Anyone Ticket";
 
 function splitName(fullName = "") {
   const parts = String(fullName).trim().split(/\s+/);
@@ -128,7 +130,7 @@ function groupByTicket(records) {
       .filter(Boolean);
 
     groupedAppointments.push({
-      ticket,
+      ticket: String(ticket).trim(),
       customer: first.Customer || "",
       phone: first.MobilePhone || "",
       email: first.Email || "",
@@ -143,8 +145,8 @@ function groupByTicket(records) {
   return groupedAppointments;
 }
 
-function getCustomFieldValue(contact, fieldKey) {
-  if (!contact || !fieldKey) return null;
+function getCustomFieldValue(contact) {
+  if (!contact) return null;
 
   const arraysToCheck = [];
 
@@ -152,20 +154,19 @@ function getCustomFieldValue(contact, fieldKey) {
   if (Array.isArray(contact.customField)) arraysToCheck.push(contact.customField);
 
   for (const fields of arraysToCheck) {
-    const match = fields.find(
-      (field) =>
-        field.id === fieldKey ||
-        field.key === fieldKey ||
-        field.fieldKey === fieldKey
-    );
+    const match = fields.find((field) => {
+      return (
+        field.id === TICKET_FIELD_ID ||
+        field.key === TICKET_FIELD_ID ||
+        field.key === TICKET_FIELD_API_KEY ||
+        field.fieldKey === TICKET_FIELD_API_KEY ||
+        field.name === TICKET_FIELD_NAME
+      );
+    });
 
     if (match) {
-      return match.value ?? match.field_value ?? null;
+      return String(match.value ?? match.field_value ?? "").trim() || null;
     }
-  }
-
-  if (contact[fieldKey] !== undefined) {
-    return contact[fieldKey];
   }
 
   return null;
@@ -240,13 +241,13 @@ async function createContact(appointment) {
 }
 
 async function updateContactTicketField(contactId, ticket) {
-  if (!contactId || !ticket || !TICKET_FIELD_KEY) return;
+  if (!contactId || !ticket) return;
 
   const body = {
     customFields: [
       {
-        key: TICKET_FIELD_KEY,
-        field_value: ticket
+        id: TICKET_FIELD_ID,
+        field_value: String(ticket).trim()
       }
     ]
   };
@@ -379,20 +380,18 @@ module.exports = async function handler(req, res) {
           continue;
         }
 
-        // IMPORTANT: fetch full contact so custom fields are available
         const fullContact = await withRetry(
           () => getContactById(contact.id),
           `Fetch full contact for ${ticket}`
         );
 
-        const existingTicket = getCustomFieldValue(fullContact, TICKET_FIELD_KEY);
+        const existingTicket = getCustomFieldValue(fullContact);
 
-        console.log(`Ticket check for ${ticket}: existing=${existingTicket || "EMPTY"} current=${ticket}`);
+        console.log(
+          `Ticket check for ${ticket}: existing=${existingTicket || "EMPTY"} current=${ticket}`
+        );
 
-        if (
-          existingTicket &&
-          String(existingTicket).trim() === String(ticket).trim()
-        ) {
+        if (existingTicket && existingTicket === ticket) {
           skipped++;
           skippedDetails.push({
             ticket,
