@@ -148,24 +148,32 @@ function groupByTicket(records) {
 function getCustomFieldValue(contact) {
   if (!contact) return null;
 
-  const arraysToCheck = [];
+  if (contact[TICKET_FIELD_ID] !== undefined && contact[TICKET_FIELD_ID] !== null) {
+    const value = String(contact[TICKET_FIELD_ID]).trim();
+    if (value) return value;
+  }
 
-  if (Array.isArray(contact.customFields)) arraysToCheck.push(contact.customFields);
-  if (Array.isArray(contact.customField)) arraysToCheck.push(contact.customField);
+  if (contact[TICKET_FIELD_API_KEY] !== undefined && contact[TICKET_FIELD_API_KEY] !== null) {
+    const value = String(contact[TICKET_FIELD_API_KEY]).trim();
+    if (value) return value;
+  }
+
+  const arraysToCheck = [
+    contact.customFields,
+    contact.customField
+  ].filter(Array.isArray);
 
   for (const fields of arraysToCheck) {
-    const match = fields.find((field) => {
-      return (
+    for (const field of fields) {
+      if (
         field.id === TICKET_FIELD_ID ||
-        field.key === TICKET_FIELD_ID ||
         field.key === TICKET_FIELD_API_KEY ||
         field.fieldKey === TICKET_FIELD_API_KEY ||
         field.name === TICKET_FIELD_NAME
-      );
-    });
-
-    if (match) {
-      return String(match.value ?? match.field_value ?? "").trim() || null;
+      ) {
+        const value = String(field.value ?? field.field_value ?? "").trim();
+        if (value) return value;
+      }
     }
   }
 
