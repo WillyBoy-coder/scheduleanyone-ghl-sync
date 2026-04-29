@@ -86,6 +86,7 @@ async function withRetry(fn, label, maxAttempts = 4) {
         await sleep(waitMs);
         continue;
       }
+
       throw error;
     }
   }
@@ -111,7 +112,7 @@ async function getAllScheduleAnyoneData(windowStart, windowEnd) {
     const start = formatSADate(chunk.start);
     const end = formatSADate(chunk.end);
 
-    console.log(`Schedule Anyone chunk: ${start} → ${end}`);
+    console.log(`Schedule Anyone chunk: ${start} -> ${end}`);
 
     const records = await withRetry(
       () => getScheduleAnyoneDataForChunk(start, end),
@@ -120,7 +121,6 @@ async function getAllScheduleAnyoneData(windowStart, windowEnd) {
 
     allRecords.push(...records);
 
-    // Sequential execution + small delay
     await sleep(750);
   }
 
@@ -281,9 +281,11 @@ function eventMatchesLegacy(event, appointment, contactId, startTime, endTime) {
   const eventEnd = event.endTime || event.end || event.endAt || "";
 
   const sameContact = String(eventContactId) === String(contactId);
+
   const sameStart =
     DateTime.fromISO(eventStart).toMillis() ===
     DateTime.fromISO(startTime).toMillis();
+
   const sameEnd =
     DateTime.fromISO(eventEnd).toMillis() ===
     DateTime.fromISO(endTime).toMillis();
@@ -366,6 +368,14 @@ module.exports = async function handler(req, res) {
         });
       }
     }
+
+    console.log("ENV DEBUG:");
+    console.log("GHL_BASE_URL:", process.env.GHL_BASE_URL);
+    console.log("GHL_LOCATION_ID:", process.env.GHL_LOCATION_ID);
+    console.log("GHL_CALENDAR_ID exists:", !!process.env.GHL_CALENDAR_ID);
+    console.log("GHL_TOKEN exists:", !!process.env.GHL_TOKEN);
+    console.log("GHL_TOKEN starts pit:", process.env.GHL_TOKEN?.startsWith("pit-"));
+    console.log("GHL_TOKEN length:", process.env.GHL_TOKEN?.length);
 
     const { start, end } = getWindow();
 
@@ -489,6 +499,8 @@ module.exports = async function handler(req, res) {
       details
     });
   } catch (error) {
+    console.log("Cron failed:", error.response?.data || error.message);
+
     return res.status(500).json({
       ok: false,
       message: error.response?.data || error.message
