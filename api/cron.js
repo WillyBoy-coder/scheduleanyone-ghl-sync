@@ -1,11 +1,12 @@
 const axios = require("axios");
 const { DateTime } = require("luxon");
 
-function splitName(fullName = "") {
-  const parts = String(fullName).trim().split(/\s+/);
-  const firstName = parts.shift() || "Unknown";
-  const lastName = parts.join(" ");
-  return { firstName, lastName };
+const SA_API_URL =
+  process.env.SA_API_URL ||
+  "https://www.membershipsalons.com/report/saledetailapi";
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function normalizePhone(phone) {
@@ -17,21 +18,23 @@ function normalizeTitle(title = "") {
   return String(title).trim().replace(/\s+/g, " ").toLowerCase();
 }
 
+function splitName(fullName = "") {
+  const parts = String(fullName).trim().split(/\s+/);
+  return {
+    firstName: parts.shift() || "Unknown",
+    lastName: parts.join(" ")
+  };
+}
+
 function toNYISO(dateStr) {
   if (!dateStr || typeof dateStr !== "string") return null;
 
-  const trimmed = dateStr.trim();
-  const parts = trimmed.split(" ");
+  const parts = dateStr.trim().split(" ");
   if (parts.length !== 2) return null;
 
   const [datePart, timePart] = parts;
-  const datePieces = datePart.split("/");
-  const timePieces = timePart.split(":");
-
-  if (datePieces.length !== 3 || timePieces.length !== 2) return null;
-
-  const [year, month, day] = datePieces;
-  const [hour, minute] = timePieces;
+  const [year, month, day] = datePart.split("/");
+  const [hour, minute] = timePart.split(":");
 
   const dt = DateTime.fromObject(
     {
@@ -48,62 +51,80 @@ function toNYISO(dateStr) {
 }
 
 function getWindow() {
-  const now = DateTime.now().setZone("America/New_York");
+  const start = DateTime.now().setZone("America/New_York").startOf("day");
   const lookaheadDays = Number(process.env.LOOKAHEAD_DAYS || 45);
-  const end = now.plus({ days: lookaheadDays });
+  const end = start.plus({ days: lookaheadDays }).endOf("day");
 
-  return {
-    start: now.toFormat("M/d/yyyy"),
-    end: end.toFormat("M/d/yyyy")
-  };
+  return { start, end };
 }
 
-function isPastAppointment(startTime) {
-  if (!startTime) return true;
-  const now = DateTime.now().setZone("America/New_York");
-  const appt = DateTime.fromISO(startTime).setZone("America/New_York");
-  return appt < now;
+function formatSADate(dt) {
+  return dt.setZone("America/New_York").toFormat("M/d/yyyy");
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function getDateChunks(start, end, chunkDays = 7) {
+  const chunks = [];
+  let cursor = start;
+
+  while (cursor <= end) {
+    const chunkEnd = DateTime.min(cursor.plus({ days: chunkDays - 1 }), end);
+    chunks.push({ start: cursor, end: chunkEnd });
+    cursor = chunkEnd.plus({ days: 1 }).startOf("day");
+  }
+
+  return chunks;
 }
 
 async function withRetry(fn, label, maxAttempts = 4) {
-  let attempt = 1;
-
-  while (attempt <= maxAttempts) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       return await fn();
     } catch (error) {
-      const status = error.response?.status;
-
-      if (status === 429 && attempt < maxAttempts) {
+      if (error.response?.status === 429 && attempt < maxAttempts) {
         const waitMs = attempt * 5000;
-        console.log(`${label} hit 429. Waiting ${waitMs / 1000}s before retry...`);
+        console.log(`${label} hit 429. Waiting ${waitMs / 1000}s...`);
         await sleep(waitMs);
-        attempt++;
         continue;
       }
-
       throw error;
     }
   }
 }
 
-async function getScheduleAnyoneData(startDate, endDate) {
-  const response = await axios.get(
-    "https://www.membershipsalons.com/report/saledetailapi",
-    {
-      params: {
-        apiToken: process.env.SA_TOKEN,
-        start: startDate,
-        end: endDate
-      }
+async function getScheduleAnyoneDataForChunk(startDate, endDate) {
+  const response = await axios.get(SA_API_URL, {
+    params: {
+      apiToken: process.env.SA_TOKEN,
+      start: startDate,
+      end: endDate
     }
-  );
+  });
 
   return Array.isArray(response.data) ? response.data : [];
+}
+
+async function getAllScheduleAnyoneData(windowStart, windowEnd) {
+  const chunks = getDateChunks(windowStart, windowEnd, 7);
+  const allRecords = [];
+
+  for (const chunk of chunks) {
+    const start = formatSADate(chunk.start);
+    const end = formatSADate(chunk.end);
+
+    console.log(`Schedule Anyone chunk: ${start} → ${end}`);
+
+    const records = await withRetry(
+      () => getScheduleAnyoneDataForChunk(start, end),
+      `Schedule Anyone fetch ${start}-${end}`
+    );
+
+    allRecords.push(...records);
+
+    // Sequential execution + small delay
+    await sleep(750);
+  }
+
+  return allRecords;
 }
 
 function groupByTicket(records) {
@@ -113,23 +134,18 @@ function groupByTicket(records) {
     const ticket = record.TicketNumber;
     if (!ticket) continue;
 
-    if (!grouped.has(ticket)) {
-      grouped.set(ticket, []);
-    }
-
+    if (!grouped.has(ticket)) grouped.set(ticket, []);
     grouped.get(ticket).push(record);
   }
 
-  const groupedAppointments = [];
-
-  for (const [ticket, items] of grouped.entries()) {
+  return Array.from(grouped.entries()).map(([ticket, items]) => {
     const first = items[0];
 
     const descriptions = items
       .map((item) => item.ItemDescription)
       .filter(Boolean);
 
-    groupedAppointments.push({
+    return {
       ticket: String(ticket).trim(),
       customer: first.Customer || "",
       phone: first.MobilePhone || "",
@@ -137,12 +153,23 @@ function groupByTicket(records) {
       staffName: first.StaffName || "",
       startDate: first.StartDate,
       endDate: first.EndDate,
-      title: descriptions.join(" + ") || first.ItemDescription || "Schedule Anyone Appointment",
+      title:
+        descriptions.join(" + ") ||
+        first.ItemDescription ||
+        "Schedule Anyone Appointment",
       rawItems: items
-    });
-  }
+    };
+  });
+}
 
-  return groupedAppointments;
+function buildGhlTitle(appointment) {
+  return `[SA ${appointment.ticket}] ${appointment.title}`;
+}
+
+function isPastAppointment(startTime) {
+  const now = DateTime.now().setZone("America/New_York");
+  const appt = DateTime.fromISO(startTime).setZone("America/New_York");
+  return appt < now;
 }
 
 async function findExistingContactByPhone(phone) {
@@ -170,8 +197,8 @@ async function findExistingContactByPhone(phone) {
 }
 
 async function createContact(appointment) {
-  const { firstName, lastName } = splitName(appointment.customer || "");
-  const phone = normalizePhone(appointment.phone || "");
+  const { firstName, lastName } = splitName(appointment.customer);
+  const phone = normalizePhone(appointment.phone);
 
   const body = {
     locationId: process.env.GHL_LOCATION_ID,
@@ -198,7 +225,7 @@ async function createContact(appointment) {
 }
 
 async function getOrCreateContact(appointment) {
-  const phone = normalizePhone(appointment.phone || "");
+  const phone = normalizePhone(appointment.phone);
   if (!phone) return null;
 
   const existing = await findExistingContactByPhone(phone);
@@ -213,10 +240,7 @@ async function getOrCreateContact(appointment) {
   }
 }
 
-async function getCalendarEventsForWindow(startTime, endTime) {
-  const startMillis = DateTime.fromISO(startTime).toMillis();
-  const endMillis = DateTime.fromISO(endTime).toMillis();
-
+async function getCalendarEvents(windowStart, windowEnd) {
   const response = await axios.get(
     `${process.env.GHL_BASE_URL}/calendars/events`,
     {
@@ -226,8 +250,8 @@ async function getCalendarEventsForWindow(startTime, endTime) {
       },
       params: {
         calendarId: process.env.GHL_CALENDAR_ID,
-        startTime: String(startMillis),
-        endTime: String(endMillis)
+        startTime: String(windowStart.toMillis()),
+        endTime: String(windowEnd.toMillis())
       }
     }
   );
@@ -240,31 +264,40 @@ async function getCalendarEventsForWindow(startTime, endTime) {
   );
 }
 
-function eventMatchesAppointment(event, appointment, contactId, startTime, endTime) {
-  const eventContactId =
-    event.contactId ||
-    event.contact?.id ||
-    event.contact?.contactId ||
-    null;
-
-  const eventStart = event.startTime || event.start || event.startAt || null;
-  const eventEnd = event.endTime || event.end || event.endAt || null;
-  const eventTitle = normalizeTitle(event.title || event.name || "");
-
-  return (
-    String(eventContactId || "") === String(contactId) &&
-    String(eventStart || "") === String(startTime) &&
-    String(eventEnd || "") === String(endTime) &&
-    eventTitle === normalizeTitle(appointment.title)
-  );
+function getEventId(event) {
+  return event.id || event.eventId || event.appointmentId || event._id || null;
 }
 
-async function appointmentAlreadyExists(appointment, contactId, startTime, endTime) {
-  const events = await getCalendarEventsForWindow(startTime, endTime);
+function eventHasTicket(event, ticket) {
+  const title = normalizeTitle(event.title || event.name || "");
+  return title.includes(String(ticket).toLowerCase());
+}
 
-  return events.some((event) =>
-    eventMatchesAppointment(event, appointment, contactId, startTime, endTime)
-  );
+function eventMatchesLegacy(event, appointment, contactId, startTime, endTime) {
+  const eventContactId =
+    event.contactId || event.contact?.id || event.contact?.contactId || "";
+
+  const eventStart = event.startTime || event.start || event.startAt || "";
+  const eventEnd = event.endTime || event.end || event.endAt || "";
+
+  const sameContact = String(eventContactId) === String(contactId);
+  const sameStart =
+    DateTime.fromISO(eventStart).toMillis() ===
+    DateTime.fromISO(startTime).toMillis();
+  const sameEnd =
+    DateTime.fromISO(eventEnd).toMillis() ===
+    DateTime.fromISO(endTime).toMillis();
+
+  return sameContact && sameStart && sameEnd;
+}
+
+function findMatchingEvent(events, appointment, contactId, startTime, endTime) {
+  return events.find((event) => {
+    return (
+      eventHasTicket(event, appointment.ticket) ||
+      eventMatchesLegacy(event, appointment, contactId, startTime, endTime)
+    );
+  });
 }
 
 async function createAppointment(appointment, contactId, startTime, endTime) {
@@ -274,7 +307,7 @@ async function createAppointment(appointment, contactId, startTime, endTime) {
     contactId,
     startTime,
     endTime,
-    title: appointment.title || "Schedule Anyone Appointment",
+    title: buildGhlTitle(appointment),
     appointmentStatus: "confirmed",
     ignoreFreeSlotValidation: true,
     ignoreDateRange: true
@@ -295,6 +328,32 @@ async function createAppointment(appointment, contactId, startTime, endTime) {
   return response.data;
 }
 
+async function updateAppointment(eventId, appointment, contactId, startTime, endTime) {
+  const body = {
+    calendarId: process.env.GHL_CALENDAR_ID,
+    locationId: process.env.GHL_LOCATION_ID,
+    contactId,
+    startTime,
+    endTime,
+    title: buildGhlTitle(appointment),
+    appointmentStatus: "confirmed",
+    ignoreFreeSlotValidation: true,
+    ignoreDateRange: true
+  };
+
+  await axios.put(
+    `${process.env.GHL_BASE_URL}/calendars/events/appointments/${eventId}`,
+    body,
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.GHL_TOKEN}`,
+        Version: "2021-04-15",
+        "Content-Type": "application/json"
+      }
+    }
+  );
+}
+
 module.exports = async function handler(req, res) {
   try {
     const authHeader = req.headers.authorization;
@@ -309,19 +368,27 @@ module.exports = async function handler(req, res) {
     }
 
     const { start, end } = getWindow();
-    console.log(`Checking Schedule Anyone from ${start} to ${end}`);
 
-    const rawRecords = await withRetry(
-      () => getScheduleAnyoneData(start, end),
-      "Schedule Anyone fetch"
+    console.log(
+      `Checking Schedule Anyone from ${formatSADate(start)} to ${formatSADate(end)}`
     );
 
+    const rawRecords = await getAllScheduleAnyoneData(start, end);
     const groupedAppointments = groupByTicket(rawRecords);
 
+    console.log(`Raw records: ${rawRecords.length}`);
+    console.log(`Grouped appointments: ${groupedAppointments.length}`);
+
+    const existingEvents = await withRetry(
+      () => getCalendarEvents(start, end),
+      "Get GHL calendar events"
+    );
+
     let created = 0;
+    let updated = 0;
     let skipped = 0;
     let errors = 0;
-    const skippedDetails = [];
+    const details = [];
 
     for (const appointment of groupedAppointments) {
       const ticket = appointment.ticket;
@@ -332,22 +399,13 @@ module.exports = async function handler(req, res) {
 
         if (!startTime || !endTime) {
           skipped++;
-          skippedDetails.push({
-            ticket,
-            customer: appointment.customer,
-            reason: "invalid date"
-          });
+          details.push({ ticket, reason: "invalid date" });
           continue;
         }
 
         if (isPastAppointment(startTime)) {
           skipped++;
-          skippedDetails.push({
-            ticket,
-            customer: appointment.customer,
-            reason: "past appointment",
-            startTime
-          });
+          details.push({ ticket, reason: "past appointment", startTime });
           continue;
         }
 
@@ -358,28 +416,41 @@ module.exports = async function handler(req, res) {
 
         if (!contact?.id) {
           skipped++;
-          skippedDetails.push({
-            ticket,
-            customer: appointment.customer,
-            reason: "no contact id"
-          });
+          details.push({ ticket, reason: "no contact id" });
           continue;
         }
 
-        const exists = await withRetry(
-          () => appointmentAlreadyExists(appointment, contact.id, startTime, endTime),
-          `Check existing appointment for ${ticket}`
+        const match = findMatchingEvent(
+          existingEvents,
+          appointment,
+          contact.id,
+          startTime,
+          endTime
         );
 
-        console.log(`Appointment existence for ${ticket}: ${exists ? "YES" : "NO"}`);
+        if (match) {
+          const eventId = getEventId(match);
 
-        if (exists) {
-          skipped++;
-          skippedDetails.push({
-            ticket,
-            customer: appointment.customer,
-            reason: "matching appointment already exists"
-          });
+          if (eventId) {
+            await withRetry(
+              () =>
+                updateAppointment(
+                  eventId,
+                  appointment,
+                  contact.id,
+                  startTime,
+                  endTime
+                ),
+              `Update appointment for ${ticket}`
+            );
+
+            updated++;
+            details.push({ ticket, reason: "updated existing appointment" });
+          } else {
+            skipped++;
+            details.push({ ticket, reason: "matched existing but no event id" });
+          }
+
           continue;
         }
 
@@ -389,28 +460,35 @@ module.exports = async function handler(req, res) {
         );
 
         created++;
-        console.log(`Created: ${ticket}`);
+        details.push({ ticket, reason: "created" });
 
         await sleep(250);
       } catch (error) {
         errors++;
-        console.log(`Error on ${ticket}:`, error.response?.data || error.message);
+        details.push({
+          ticket,
+          reason: "error",
+          error: error.response?.data || error.message
+        });
       }
     }
 
     return res.status(200).json({
       ok: true,
-      window: { start, end },
+      window: {
+        start: formatSADate(start),
+        end: formatSADate(end)
+      },
       rawRecordCount: rawRecords.length,
-      groupedServiceCount: groupedAppointments.length,
+      groupedAppointmentCount: groupedAppointments.length,
+      existingGhlEventCount: existingEvents.length,
       created,
+      updated,
       skipped,
       errors,
-      skippedDetails
+      details
     });
   } catch (error) {
-    console.log("Cron failed:", error.response?.data || error.message);
-
     return res.status(500).json({
       ok: false,
       message: error.response?.data || error.message
