@@ -246,9 +246,11 @@ async function getCalendarEvents(windowStart, windowEnd) {
     {
       headers: {
         Authorization: `Bearer ${process.env.GHL_TOKEN}`,
-        Version: "2021-04-15"
+        Version: "2023-02-21",
+        Accept: "application/json"
       },
       params: {
+        locationId: process.env.GHL_LOCATION_ID,
         calendarId: process.env.GHL_CALENDAR_ID,
         startTime: String(windowStart.toMillis()),
         endTime: String(windowEnd.toMillis())
